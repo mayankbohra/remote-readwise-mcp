@@ -54,19 +54,36 @@ class ReadwiseClient:
         self,
         location: Optional[str] = None,
         category: Optional[str] = None,
-        limit: int = 20,
+        limit: Optional[int] = 20,
+        updated_after: Optional[str] = None,
         **kwargs
     ) -> List[Dict[str, Any]]:
-        """List documents from Reader"""
+        """
+        List documents from Reader with efficient filtering.
+
+        Args:
+            location: Filter by location (new, later, archive, feed)
+            category: Filter by category
+            limit: Maximum documents to return. Set to None for unlimited.
+            updated_after: ISO 8601 timestamp - only fetch documents updated after this time
+                          Example: "2025-11-01T00:00:00Z"
+                          Useful for incremental syncs
+
+        Returns:
+            List of documents
+        """
         params = {"pageCursor": None}
         if location:
             params["location"] = location
         if category:
             params["category"] = category
+        if updated_after:
+            params["updatedAfter"] = updated_after
 
         all_results = []
+        fetch_all = limit is None
 
-        while len(all_results) < limit:
+        while True:
             response = await self._request("GET", f"{self.v3_base_url}/list", params=params)
             results = response.get("results", [])
 
@@ -75,13 +92,17 @@ class ReadwiseClient:
 
             all_results.extend(results)
 
+            # Stop if we've reached the limit
+            if not fetch_all and len(all_results) >= limit:
+                return all_results[:limit]
+
             next_cursor = response.get("nextPageCursor")
             if not next_cursor:
                 break
 
             params["pageCursor"] = next_cursor
 
-        return all_results[:limit]
+        return all_results if fetch_all else all_results[:limit]
 
     async def update_document(self, document_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
         """Update a document in Reader"""
@@ -123,18 +144,64 @@ class ReadwiseClient:
         page_size: int = 100,
         page: int = 1,
         book_id: Optional[int] = None,
+        fetch_all: bool = False,
         **filters
     ) -> Dict[str, Any]:
-        """List highlights with filtering"""
-        params = {
-            "page_size": page_size,
-            "page": page
-        }
-        if book_id:
-            params["book_id"] = book_id
-        params.update(filters)
+        """
+        List highlights with filtering.
 
-        return await self._request("GET", f"{self.v2_base_url}/highlights", params=params, api_version="v2")
+        Args:
+            page_size: Number of highlights per page (max 1000)
+            page: Page number to fetch (ignored if fetch_all=True)
+            book_id: Filter by specific book ID
+            fetch_all: If True, fetches all pages and returns all results
+            **filters: Additional filters (highlighted_at__gt, highlighted_at__lt, etc.)
+
+        Returns:
+            Dict with 'results', 'count', and pagination info if fetch_all=False
+            Dict with 'results' containing all highlights if fetch_all=True
+        """
+        if not fetch_all:
+            # Single page fetch
+            params = {
+                "page_size": page_size,
+                "page": page
+            }
+            if book_id:
+                params["book_id"] = book_id
+            params.update(filters)
+            return await self._request("GET", f"{self.v2_base_url}/highlights", params=params, api_version="v2")
+
+        # Fetch all pages
+        all_results = []
+        current_page = 1
+        while True:
+            params = {
+                "page_size": 1000,  # Max page size
+                "page": current_page
+            }
+            if book_id:
+                params["book_id"] = book_id
+            params.update(filters)
+
+            response = await self._request("GET", f"{self.v2_base_url}/highlights", params=params, api_version="v2")
+            results = response.get("results", [])
+
+            if not results:
+                break
+
+            all_results.extend(results)
+
+            # Check if there's a next page
+            if not response.get("next"):
+                break
+
+            current_page += 1
+
+        return {
+            "results": all_results,
+            "count": len(all_results)
+        }
 
     async def get_daily_review(self) -> Dict[str, Any]:
         """Get daily review highlights (spaced repetition)"""
@@ -144,38 +211,136 @@ class ReadwiseClient:
         self,
         query: str,
         page_size: int = 100,
-        page: int = 1
-    ) -> List[Dict[str, Any]]:
-        """Search highlights by text query"""
-        params = {
-            "q": query,
-            "page_size": page_size,
-            "page": page
+        page: int = 1,
+        fetch_all: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Search highlights by text query.
+
+        Args:
+            query: Search term (searches highlight text and notes)
+            page_size: Number of results per page (ignored if fetch_all=True)
+            page: Page number (ignored if fetch_all=True)
+            fetch_all: If True, fetches all matching highlights across all pages
+
+        Returns:
+            Dict with 'results' list and 'count'
+        """
+        if not fetch_all:
+            # Single page search
+            params = {
+                "q": query,
+                "page_size": page_size,
+                "page": page
+            }
+            response = await self._request("GET", f"{self.v2_base_url}/highlights", params=params, api_version="v2")
+            return {
+                "results": response.get("results", []),
+                "count": len(response.get("results", []))
+            }
+
+        # Fetch all matching results
+        all_results = []
+        current_page = 1
+        while True:
+            params = {
+                "q": query,
+                "page_size": 1000,  # Max page size
+                "page": current_page
+            }
+            response = await self._request("GET", f"{self.v2_base_url}/highlights", params=params, api_version="v2")
+            results = response.get("results", [])
+
+            if not results:
+                break
+
+            all_results.extend(results)
+
+            # Check if there's a next page
+            if not response.get("next"):
+                break
+
+            current_page += 1
+
+        return {
+            "results": all_results,
+            "count": len(all_results)
         }
-        response = await self._request("GET", f"{self.v2_base_url}/highlights", params=params, api_version="v2")
-        return response.get("results", [])
 
     async def list_books(
         self,
         page_size: int = 100,
         page: int = 1,
         category: Optional[str] = None,
+        fetch_all: bool = False,
         **filters
     ) -> Dict[str, Any]:
-        """List books with metadata"""
-        params = {
-            "page_size": page_size,
-            "page": page
+        """
+        List books with metadata.
+
+        Args:
+            page_size: Number of books per page
+            page: Page number (ignored if fetch_all=True)
+            category: Filter by category (books, articles, tweets, podcasts)
+            fetch_all: If True, fetches all pages and returns all results
+            **filters: Additional filters (last_highlight_at__gt, etc.)
+
+        Returns:
+            Dict with 'results', 'count', and pagination info
+        """
+        if not fetch_all:
+            # Single page fetch
+            params = {
+                "page_size": page_size,
+                "page": page
+            }
+            if category:
+                params["category"] = category
+            params.update(filters)
+            return await self._request("GET", f"{self.v2_base_url}/books", params=params, api_version="v2")
+
+        # Fetch all pages
+        all_results = []
+        current_page = 1
+        while True:
+            params = {
+                "page_size": 1000,  # Max page size
+                "page": current_page
+            }
+            if category:
+                params["category"] = category
+            params.update(filters)
+
+            response = await self._request("GET", f"{self.v2_base_url}/books", params=params, api_version="v2")
+            results = response.get("results", [])
+
+            if not results:
+                break
+
+            all_results.extend(results)
+
+            # Check if there's a next page
+            if not response.get("next"):
+                break
+
+            current_page += 1
+
+        return {
+            "results": all_results,
+            "count": len(all_results)
         }
-        if category:
-            params["category"] = category
-        params.update(filters)
 
-        return await self._request("GET", f"{self.v2_base_url}/books", params=params, api_version="v2")
+    async def get_book_highlights(self, book_id: int) -> Dict[str, Any]:
+        """
+        Get ALL highlights from a specific book.
 
-    async def get_book_highlights(self, book_id: int) -> List[Dict[str, Any]]:
-        """Get all highlights from a specific book"""
-        return await self.list_highlights(book_id=book_id)
+        Args:
+            book_id: The ID of the book
+
+        Returns:
+            Dict with 'results' list containing all highlights and 'count'
+        """
+        return await self.list_highlights(book_id=book_id, fetch_all=True)
 
     async def export_highlights(
         self,

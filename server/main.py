@@ -77,29 +77,63 @@ async def readwise_save_document(
 async def readwise_list_documents(
     location: Optional[str] = None,
     category: Optional[str] = None,
-    limit: int = 20,
+    author: Optional[str] = None,
+    site_name: Optional[str] = None,
+    limit: Optional[int] = 20,
+    fetch_all: bool = False,
+    updated_after: Optional[str] = None,
     with_full_content: bool = False,
     content_max_length: Optional[int] = None
 ) -> str:
     """
-    List documents from Readwise Reader with smart content controls.
+    List documents from Readwise Reader with advanced filtering and unlimited fetch support.
 
     Args:
         location: Filter by location (new, later, archive, feed)
         category: Filter by category (article, email, rss, etc.)
-        limit: Maximum number of documents to return (default: 20)
+        author: Filter by author name (case-insensitive partial match)
+        site_name: Filter by site name (case-insensitive partial match)
+        limit: Maximum documents to return. Ignored if fetch_all=True (default: 20)
+        fetch_all: If True, fetches ALL documents across all pages (ignores limit)
+        updated_after: ISO 8601 timestamp - only documents updated after this time
+                      Example: "2025-11-01T00:00:00Z"
+                      Useful for incremental syncs (fetch only new/updated docs)
         with_full_content: Include full document content (warning: may be large)
         content_max_length: Limit content length per document
 
     Returns:
-        JSON string with document list
+        JSON string with filtered document list
+
+    Examples:
+        - Get all documents by author: fetch_all=True, author="sukhad anand"
+        - Get all LinkedIn posts: fetch_all=True, site_name="linkedin.com"
+        - Get recent articles: updated_after="2025-11-01T00:00:00Z", category="article"
+        - Incremental sync: fetch_all=True, updated_after="2025-11-28T00:00:00Z"
     """
     try:
+        # Fetch documents from API
+        effective_limit = None if fetch_all else limit
         documents = await client.list_documents(
             location=location,
             category=category,
-            limit=limit
+            limit=effective_limit,
+            updated_after=updated_after
         )
+
+        # Apply client-side filtering
+        if author:
+            author_lower = author.lower()
+            documents = [
+                doc for doc in documents
+                if doc.get("author") and author_lower in doc["author"].lower()
+            ]
+
+        if site_name:
+            site_lower = site_name.lower()
+            documents = [
+                doc for doc in documents
+                if doc.get("site_name") and site_lower in doc["site_name"].lower()
+            ]
 
         # Process content if requested
         if not with_full_content:
@@ -110,7 +144,22 @@ async def readwise_list_documents(
                 if "content" in doc and len(doc["content"]) > content_max_length:
                     doc["content"] = doc["content"][:content_max_length] + "..."
 
-        return f"Found {len(documents)} documents: {documents}"
+        # Build descriptive result message
+        filters_applied = []
+        if location:
+            filters_applied.append(f"location={location}")
+        if category:
+            filters_applied.append(f"category={category}")
+        if author:
+            filters_applied.append(f"author contains '{author}'")
+        if site_name:
+            filters_applied.append(f"site contains '{site_name}'")
+        if updated_after:
+            filters_applied.append(f"updated after {updated_after}")
+
+        filter_desc = f" (filtered by: {', '.join(filters_applied)})" if filters_applied else ""
+
+        return f"Found {len(documents)} documents{filter_desc}: {documents}"
     except Exception as e:
         logger.error(f"Error listing documents: {e}")
         return f"Error: {str(e)}"
@@ -233,21 +282,28 @@ async def readwise_list_highlights(
     book_id: Optional[int] = None,
     page_size: int = 100,
     page: int = 1,
+    fetch_all: bool = False,
     highlighted_at__gt: Optional[str] = None,
     highlighted_at__lt: Optional[str] = None
 ) -> str:
     """
-    List highlights from Readwise with advanced filtering.
+    List highlights from Readwise with advanced filtering and unlimited fetch support.
 
     Args:
         book_id: Filter by specific book ID
-        page_size: Number of highlights per page (max 1000)
-        page: Page number
+        page_size: Number of highlights per page (max 1000, ignored if fetch_all=True)
+        page: Page number (ignored if fetch_all=True)
+        fetch_all: If True, fetches ALL highlights across all pages
         highlighted_at__gt: Filter highlights after this date (ISO 8601)
         highlighted_at__lt: Filter highlights before this date (ISO 8601)
 
     Returns:
         JSON string with highlights
+
+    Examples:
+        - Get all highlights: fetch_all=True
+        - Get all highlights from specific book: fetch_all=True, book_id=12345
+        - Get highlights from last week: highlighted_at__gt="2025-11-01T00:00:00Z"
     """
     try:
         filters = {}
@@ -260,6 +316,7 @@ async def readwise_list_highlights(
             page_size=page_size,
             page=page,
             book_id=book_id,
+            fetch_all=fetch_all,
             **filters
         )
 
@@ -276,7 +333,9 @@ async def readwise_list_highlights(
             for h in highlights
         ]
 
-        return f"Found {len(optimized)} highlights: {optimized}"
+        total_count = result.get("count", len(optimized))
+        fetch_mode = "all pages" if fetch_all else f"page {page}"
+        return f"Found {total_count} highlights ({fetch_mode}): {optimized}"
     except Exception as e:
         logger.error(f"Error listing highlights: {e}")
         return f"Error: {str(e)}"
@@ -316,38 +375,49 @@ async def readwise_get_daily_review() -> str:
 async def readwise_search_highlights(
     query: str,
     page_size: int = 100,
-    page: int = 1
+    page: int = 1,
+    fetch_all: bool = False
 ) -> str:
     """
-    Search highlights by text query.
+    Search highlights by text query with unlimited fetch support.
 
     Args:
         query: Search term (searches highlight text and notes)
-        page_size: Number of results per page
-        page: Page number
+        page_size: Number of results per page (ignored if fetch_all=True)
+        page: Page number (ignored if fetch_all=True)
+        fetch_all: If True, fetches ALL matching highlights across all pages
 
     Returns:
         JSON string with matching highlights
+
+    Examples:
+        - Search all highlights: query="machine learning", fetch_all=True
+        - Search first page: query="python", page_size=50
     """
     try:
-        results = await client.search_highlights(
+        result = await client.search_highlights(
             query=query,
             page_size=page_size,
-            page=page
+            page=page,
+            fetch_all=fetch_all
         )
 
         # Optimize response
+        highlights = result.get("results", [])
         optimized = [
             {
                 "id": h.get("id"),
                 "text": h.get("text"),
                 "book_id": h.get("book_id"),
-                "note": h.get("note")
+                "note": h.get("note"),
+                "title": h.get("title")
             }
-            for h in results
+            for h in highlights
         ]
 
-        return f"Found {len(optimized)} matching highlights: {optimized}"
+        total_count = result.get("count", len(optimized))
+        fetch_mode = "all matches" if fetch_all else f"page {page}"
+        return f"Found {total_count} matching highlights ({fetch_mode}): {optimized}"
     except Exception as e:
         logger.error(f"Error searching highlights: {e}")
         return f"Error: {str(e)}"
@@ -358,19 +428,26 @@ async def readwise_list_books(
     category: Optional[str] = None,
     page_size: int = 100,
     page: int = 1,
+    fetch_all: bool = False,
     last_highlight_at__gt: Optional[str] = None
 ) -> str:
     """
-    List books with highlight metadata.
+    List books with highlight metadata and unlimited fetch support.
 
     Args:
         category: Filter by category (books, articles, tweets, podcasts)
-        page_size: Number of books per page
-        page: Page number
+        page_size: Number of books per page (ignored if fetch_all=True)
+        page: Page number (ignored if fetch_all=True)
+        fetch_all: If True, fetches ALL books across all pages
         last_highlight_at__gt: Filter books with highlights after this date
 
     Returns:
         JSON string with books
+
+    Examples:
+        - Get all books: fetch_all=True
+        - Get all articles: fetch_all=True, category="articles"
+        - Get books with recent highlights: last_highlight_at__gt="2025-11-01T00:00:00Z"
     """
     try:
         filters = {}
@@ -381,6 +458,7 @@ async def readwise_list_books(
             page_size=page_size,
             page=page,
             category=category,
+            fetch_all=fetch_all,
             **filters
         )
 
@@ -397,7 +475,9 @@ async def readwise_list_books(
             for b in books
         ]
 
-        return f"Found {len(optimized)} books: {optimized}"
+        total_count = result.get("count", len(optimized))
+        fetch_mode = "all pages" if fetch_all else f"page {page}"
+        return f"Found {total_count} books ({fetch_mode}): {optimized}"
     except Exception as e:
         logger.error(f"Error listing books: {e}")
         return f"Error: {str(e)}"
@@ -406,15 +486,19 @@ async def readwise_list_books(
 @mcp.tool()
 async def readwise_get_book_highlights(book_id: int) -> str:
     """
-    Get all highlights from a specific book.
+    Get ALL highlights from a specific book (automatically fetches all pages).
 
     Args:
-        book_id: The ID of the book
+        book_id: The ID of the book to get highlights from
 
     Returns:
-        JSON string with book highlights
+        JSON string with all book highlights
+
+    Example:
+        - Get all highlights from book: book_id=123456
     """
     try:
+        # This now automatically fetches all pages
         result = await client.get_book_highlights(book_id)
 
         highlights = result.get("results", [])
@@ -423,12 +507,14 @@ async def readwise_get_book_highlights(book_id: int) -> str:
                 "id": h.get("id"),
                 "text": h.get("text"),
                 "note": h.get("note"),
-                "location": h.get("location")
+                "location": h.get("location"),
+                "highlighted_at": h.get("highlighted_at")
             }
             for h in highlights
         ]
 
-        return f"Found {len(optimized)} highlights for book {book_id}: {optimized}"
+        total_count = result.get("count", len(optimized))
+        return f"Found {total_count} highlights for book {book_id} (all pages): {optimized}"
     except Exception as e:
         logger.error(f"Error getting book highlights: {e}")
         return f"Error: {str(e)}"
@@ -437,36 +523,63 @@ async def readwise_get_book_highlights(book_id: int) -> str:
 @mcp.tool()
 async def readwise_export_highlights(
     updated_after: Optional[str] = None,
-    include_deleted: bool = False
+    include_deleted: bool = False,
+    max_results: Optional[int] = None
 ) -> str:
     """
-    Bulk export highlights for analysis and backup.
+    Bulk export ALL highlights for analysis and backup.
+
+    This tool automatically fetches all pages of highlights. For large libraries,
+    this may take time and return thousands of results.
 
     Args:
-        updated_after: Export only highlights updated after this date (ISO 8601)
-        include_deleted: Include deleted highlights
+        updated_after: Export only highlights updated after this date (ISO 8601 format)
+                      Example: "2025-11-01T00:00:00Z"
+                      Tip: Use this for incremental syncs after initial full export
+        include_deleted: Include deleted highlights in export
+        max_results: Optional limit on number of highlights to return (for testing)
+                    Defaults to None (unlimited). Set to reasonable number for large exports.
 
     Returns:
-        JSON string with exported highlights
+        JSON string with ALL exported highlights
+
+    Examples:
+        - Full export: (no parameters)
+        - Incremental since Nov 1: updated_after="2025-11-01T00:00:00Z"
+        - Last week's changes: updated_after="2025-11-28T00:00:00Z"
+
+    Warning: Full exports from large libraries may take 30+ seconds and return 10,000+ highlights
     """
     try:
+        # Export already fetches all pages internally
         highlights = await client.export_highlights(
             updated_after=updated_after,
             include_deleted=include_deleted
         )
 
-        # Optimize response
+        # Apply max_results limit if specified
+        if max_results:
+            highlights = highlights[:max_results]
+            result_msg = f"(limited to first {max_results})"
+        else:
+            result_msg = "(all highlights)"
+
+        # Optimize response - include more useful fields
         optimized = [
             {
                 "id": h.get("id"),
                 "text": h.get("text"),
+                "title": h.get("title"),
+                "author": h.get("author"),
                 "book_id": h.get("book_id"),
+                "note": h.get("note"),
+                "highlighted_at": h.get("highlighted_at"),
                 "updated": h.get("updated")
             }
-            for h in highlights[:1000]  # Limit to prevent huge responses
+            for h in highlights
         ]
 
-        return f"Exported {len(highlights)} highlights (showing first 1000): {optimized}"
+        return f"Exported {len(optimized)} highlights {result_msg}: {optimized}"
     except Exception as e:
         logger.error(f"Error exporting highlights: {e}")
         return f"Error: {str(e)}"
