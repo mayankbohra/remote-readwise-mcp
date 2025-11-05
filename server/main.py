@@ -560,6 +560,7 @@ def create_app():
     mcp_app = mcp.http_app()
 
     # Create wrapper app with auth and CORS
+    # IMPORTANT: Pass the FastMCP app's lifespan to Starlette
     app = Starlette(
         routes=[
             Route("/health", health_check),
@@ -573,7 +574,8 @@ def create_app():
                 allow_methods=["*"],
                 allow_headers=["*"],
             )
-        ]
+        ],
+        lifespan=mcp_app.lifespan  # Fix: Pass FastMCP's lifespan manager
     )
 
     # Add auth middleware
