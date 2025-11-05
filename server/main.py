@@ -14,11 +14,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastMCP with API key authentication
-mcp = FastMCP(
-    "Readwise MCP Enhanced",
-    dependencies=["httpx", "python-dotenv"]
-)
+# Initialize FastMCP
+mcp = FastMCP("Readwise MCP Enhanced")
 
 # Get configuration from environment
 READWISE_TOKEN = os.getenv("READWISE_TOKEN")
@@ -520,33 +517,23 @@ async def readwise_create_highlight(
 
 # ==================== Server Entry Point ====================
 
-if __name__ == "__main__":
-    from fastapi import FastAPI, Request, HTTPException
-    from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import JSONResponse
-    import uvicorn
+def create_app():
+    """Create the ASGI app with authentication wrapper"""
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route, Mount
 
-    port = int(os.getenv("PORT", 8000))
-    host = os.getenv("HOST", "0.0.0.0")
+    async def health_check(request):
+        return JSONResponse({
+            "status": "healthy",
+            "service": "readwise-mcp-enhanced",
+            "version": "1.0.0",
+            "authentication": "enabled" if MCP_API_KEY else "disabled"
+        })
 
-    logger.info(f"Starting Readwise MCP Enhanced server on {host}:{port}")
-    logger.info(f"Authentication: {'Enabled' if MCP_API_KEY else 'Disabled (WARNING: Not secure for production)'}")
-
-    # Get the FastAPI app from FastMCP
-    app = mcp.get_app()
-
-    # Add CORS middleware for Claude.ai
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["https://claude.ai", "https://claude.com", "https://*.anthropic.com"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # Add authentication middleware
-    @app.middleware("http")
-    async def auth_middleware(request: Request, call_next):
+    async def auth_middleware(request, call_next):
         # Skip auth for health check
         if request.url.path == "/health":
             return await call_next(request)
@@ -556,28 +543,56 @@ if __name__ == "__main__":
             auth_header = request.headers.get("authorization", "")
             if not auth_header.startswith("Bearer "):
                 return JSONResponse(
-                    status_code=401,
-                    content={"error": "Missing or invalid Authorization header"}
+                    {"error": "Missing or invalid Authorization header"},
+                    status_code=401
                 )
 
             token = auth_header.replace("Bearer ", "")
             if token != MCP_API_KEY:
                 return JSONResponse(
-                    status_code=401,
-                    content={"error": "Invalid API key"}
+                    {"error": "Invalid API key"},
+                    status_code=401
                 )
 
         return await call_next(request)
 
-    # Add health check endpoint
-    @app.get("/health")
-    async def health_check():
-        return {
-            "status": "healthy",
-            "service": "readwise-mcp-enhanced",
-            "version": "1.0.0",
-            "authentication": "enabled" if MCP_API_KEY else "disabled"
-        }
+    # Get the FastMCP ASGI app
+    mcp_app = mcp.http_app()
 
-    # Run the server
+    # Create wrapper app with auth and CORS
+    app = Starlette(
+        routes=[
+            Route("/health", health_check),
+            Mount("/", mcp_app)
+        ],
+        middleware=[
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["https://claude.ai", "https://claude.com", "https://*.anthropic.com"],
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+        ]
+    )
+
+    # Add auth middleware
+    @app.middleware("http")
+    async def add_auth(request, call_next):
+        return await auth_middleware(request, call_next)
+
+    return app
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", 8000))
+    host = os.getenv("HOST", "0.0.0.0")
+
+    logger.info(f"Starting Readwise MCP Enhanced server on {host}:{port}")
+    logger.info(f"Authentication: {'Enabled' if MCP_API_KEY else 'Disabled (WARNING: Not secure for production)'}")
+
+    # Create and run the app
+    app = create_app()
     uvicorn.run(app, host=host, port=port)
