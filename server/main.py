@@ -534,8 +534,9 @@ def create_app():
         })
 
     async def auth_middleware(request, call_next):
-        # Skip auth for health check
-        if request.url.path == "/health":
+        # Skip auth for health check and OAuth discovery endpoints
+        if request.url.path in ["/health", "/.well-known/oauth-protected-resource",
+                                "/.well-known/oauth-authorization-server", "/register"]:
             return await call_next(request)
 
         # Check API key if configured
@@ -561,10 +562,11 @@ def create_app():
 
     # Create wrapper app with auth and CORS
     # IMPORTANT: Pass the FastMCP app's lifespan to Starlette
+    # Mount MCP at root for Claude.ai compatibility (it expects MCP at /)
     app = Starlette(
         routes=[
-            Route("/health", health_check),
-            Mount("/", mcp_app)
+            Route("/health", health_check, methods=["GET"]),  # Health check first
+            Mount("/", mcp_app)  # MCP at root for Claude.ai
         ],
         middleware=[
             Middleware(
