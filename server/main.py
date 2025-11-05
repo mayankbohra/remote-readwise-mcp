@@ -562,11 +562,12 @@ def create_app():
 
     # Create wrapper app with auth and CORS
     # IMPORTANT: Pass the FastMCP app's lifespan to Starlette
-    # Mount MCP at root for Claude.ai compatibility (it expects MCP at /)
+    # FastMCP's http_app() expects to handle requests at its root
+    # So we mount it at / and it will handle /mcp endpoint internally
     app = Starlette(
         routes=[
-            Route("/health", health_check, methods=["GET"]),  # Health check first
-            Mount("/", mcp_app)  # MCP at root for Claude.ai
+            Route("/health", health_check, methods=["GET", "HEAD"]),
+            Mount("/", mcp_app)  # FastMCP handles /mcp internally
         ],
         middleware=[
             Middleware(
