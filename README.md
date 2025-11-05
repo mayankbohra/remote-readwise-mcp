@@ -3,7 +3,7 @@
 [![npm version](https://badge.fury.io/js/readwise-mcp-enhanced.svg)](https://badge.fury.io/js/readwise-mcp-enhanced)
 [![npm downloads](https://img.shields.io/npm/dm/readwise-mcp-enhanced.svg)](https://www.npmjs.com/package/readwise-mcp-enhanced)
 
-A comprehensive Model Context Protocol (MCP) server that unifies **Readwise Reader** document management with **full Readwise highlights** functionality. Works with Claude Desktop, Continue, and any MCP-compatible AI tool. Built with TypeScript, featuring advanced text processing, smart content controls, and context-optimized responses.
+A comprehensive Model Context Protocol (MCP) server that unifies **Readwise Reader** document management with **full Readwise highlights** functionality. Works with **Claude.ai** (web app), Claude Desktop, Continue, and any MCP-compatible AI tool. Available as both a local TypeScript server and a remote FastMCP Python server for cloud deployment.
 
 ## 🚀 What This Is
 
@@ -42,6 +42,23 @@ A comprehensive Model Context Protocol (MCP) server that unifies **Readwise Read
 ---
 
 ## 🛠️ Installation
+
+### 🌐 For Claude.ai (Web App) - Remote Server
+
+**Use this if you want to access Readwise from Claude.ai on any device!**
+
+Deploy the FastMCP remote server to use with Claude.ai's custom connectors feature (Pro/Max/Team/Enterprise plans):
+
+👉 **[See Remote Server Setup Guide](./server/README.md)**
+
+Quick deployment to Render (free tier available):
+1. Deploy the `server/` directory to Render
+2. Set `READWISE_TOKEN` and `MCP_API_KEY` environment variables
+3. Add as custom connector in Claude.ai Settings → Connectors
+
+---
+
+### 💻 For Claude Desktop & Local Use
 
 ### Option 1: NPX - No Installation Required! (Recommended)
 

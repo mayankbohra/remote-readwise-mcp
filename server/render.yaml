@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: readwise-mcp-enhanced
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: ./server
+    envVars:
+      - key: READWISE_TOKEN
+        sync: false
+      - key: MCP_API_KEY
+        sync: false
+      - key: PORT
+        value: 8000
+      - key: HOST
+        value: 0.0.0.0
+    healthCheckPath: /health
+    autoDeploy: true
+    plan: free
