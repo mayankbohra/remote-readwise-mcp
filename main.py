@@ -3,6 +3,7 @@
 import os
 import json
 import traceback
+import asyncio
 from typing import Optional, List, Dict, Any
 from fastmcp import FastMCP
 from readwise_client import ReadwiseClient
@@ -678,26 +679,25 @@ async def readwise_search_highlights(
     max_limit: Optional[int] = 500
 ) -> str:
     """
-    Search highlights by text query with parallel fetching and relevance ranking.
-    Fetches multiple pages in parallel, scores ALL results by relevance, returns top N most relevant.
+    Search highlights by text query using the MCP endpoint (matches official Readwise MCP behavior).
     
-    This ensures relevant results beyond the first page are found and ranked properly.
-    Uses parallel fetching for low latency (1-3 seconds typical).
+    This tool uses the same MCP endpoint as the official Readwise MCP implementation,
+    providing vector/semantic search capabilities for better results.
 
     Args:
-        query: Search term (searches highlight text and notes)
+        query: Search term (searches highlight text and notes using vector search)
         limit: Maximum number of results to return (default: 20). Recommended: 10-30 for context efficiency.
-        page_size: Number of results per page (default: 100, max 1000)
-        fetch_all: If True, fetches more pages up to max_limit (default: False)
-        max_limit: Maximum highlights to fetch when fetch_all=True (default: 500)
+        page_size: Not used with MCP endpoint (kept for compatibility)
+        fetch_all: Not used with MCP endpoint (kept for compatibility)
+        max_limit: Not used with MCP endpoint (kept for compatibility)
 
     Returns:
-        JSON string with top N most relevant highlights (scored and ranked)
+        JSON string with matching highlights (results are already ranked by relevance from MCP endpoint)
 
     Examples:
         - Quick search: query="machine learning", limit=20
         - More results: query="python", limit=50
-        - Comprehensive search: query="AI", fetch_all=True, max_limit=500
+        - AI search: query="AI artificial intelligence machine learning LLM", limit=30
     """
     try:
         # Parameter validation
@@ -705,161 +705,55 @@ async def readwise_search_highlights(
             return format_json_response({"error": "query cannot be empty"})
         if limit <= 0 or limit > 1000:
             return format_json_response({"error": "limit must be between 1 and 1000"})
-        if max_limit is not None and max_limit <= 0:
-            return format_json_response({"error": "max_limit must be a positive integer"})
-        if page_size <= 0 or page_size > 1000:
-            return format_json_response({"error": "page_size must be between 1 and 1000"})
         
         query_clean = query.strip()
         
-        # Determine how many pages to fetch based on limit
-        # Fetch 5-10x the limit to find best matches across pages
-        if fetch_all and max_limit:
-            target_results = min(max_limit, limit * 10)
-        else:
-            target_results = limit * 5  # Fetch 5x to find best matches
-        
-        num_pages = max(3, min(10, (target_results + page_size - 1) // page_size))
-        
-        # Create fetch function wrapper
-        async def fetch_page(page: int, page_size: int, **kwargs):
-            result = await client.search_highlights(
-                query=query_clean,
-                page_size=page_size,
-                page=page,
-                fetch_all=False,
-                max_limit=None
-            )
-            return result
-        
-        # Fetch pages in parallel with relevance scoring
-        all_highlights = await fetch_pages_parallel(
-            fetch_func=fetch_page,
-            query=query_clean,
-            num_pages=num_pages,
-            page_size=page_size,
-            batch_size=3,
-            rate_limit_delay=client.rate_limit_delay
+        # Use MCP endpoint for search (matches official Readwise MCP)
+        # Convert simple query to vector search term and add full-text queries for better matching
+        result = await client.search_highlights_mcp(
+            vector_search_term=query_clean,
+            full_text_queries=[
+                {"field_name": "highlight_plaintext", "search_term": query_clean},
+                {"field_name": "document_title", "search_term": query_clean}
+            ]
         )
         
-        # Take top N most relevant (already sorted by relevance_score)
-        highlights = all_highlights[:limit]
+        # Extract results from MCP response
+        mcp_results = result.get("results", [])
         
-        # Optimize response - only return essential fields
-        optimized = [
-            {
-                "id": h.get("id"),
-                "text": h.get("text"),
-                "book_id": h.get("book_id"),
-                "note": h.get("note"),
-                "title": h.get("title")
-            }
-            for h in highlights
-        ]
+        # Apply limit
+        highlights = mcp_results[:limit]
+        
+        # Format results to match expected structure
+        # MCP results have different structure: they include 'id', 'score', and 'attributes'
+        formatted_results = []
+        for item in highlights:
+            # MCP results structure: {id, score, attributes: {highlight_plaintext, document_title, etc.}}
+            attrs = item.get("attributes", {})
+            formatted_results.append({
+                "id": item.get("id"),
+                "score": item.get("score"),
+                "text": attrs.get("highlight_plaintext", ""),
+                "note": attrs.get("highlight_note", ""),
+                "title": attrs.get("document_title", ""),
+                "author": attrs.get("document_author", ""),
+                "category": attrs.get("document_category", ""),
+                "highlight_tags": attrs.get("highlight_tags", []),
+                "document_tags": attrs.get("document_tags", [])
+            })
 
         return format_json_response({
-            "count": len(optimized),
-            "results": optimized,
+            "count": len(formatted_results),
+            "results": formatted_results,
             "query": query_clean,
             "limit_applied": limit,
-            "pages_searched": num_pages,
-            "total_fetched": len(all_highlights),
-            "note": f"Searched {num_pages} pages in parallel, scored {len(all_highlights)} results, returned top {len(optimized)} most relevant."
+            "total_fetched": len(mcp_results),
+            "note": f"Used MCP endpoint with vector search, returned top {len(formatted_results)} most relevant results."
         })
     except Exception as e:
         logger.error(f"Error searching highlights: {e}")
         logger.error(traceback.format_exc())
         return format_json_response({"error": str(e), "message": "Failed to search highlights"})
-
-
-@mcp.tool()
-async def search_readwise_highlights(
-    vector_search_term: str,
-    full_text_queries: Optional[List[Dict[str, str]]] = None
-) -> str:
-    """
-    Search Readwise highlights using the MCP endpoint with vector and field-specific full-text search.
-    
-    This tool matches the official Readwise MCP implementation and provides advanced search capabilities:
-    - Vector/semantic search for finding conceptually similar content
-    - Field-specific full-text search across document metadata and highlight content
-    
-    Args:
-        vector_search_term: String for vector/semantic search (searches for conceptually similar content)
-        full_text_queries: Optional list of field-specific queries (max 8). Each query object should have:
-            - field_name: One of "document_author", "document_title", "highlight_note", 
-                          "highlight_plaintext", "highlight_tags"
-            - search_term: The search term for that specific field
-    
-    Returns:
-        JSON string with results array containing matching highlights with scores and attributes
-    
-    Examples:
-        - Search for GenAI content:
-          vector_search_term="generative AI GenAI artificial intelligence"
-          full_text_queries=[
-            {"field_name": "highlight_plaintext", "search_term": "GenAI"},
-            {"field_name": "highlight_plaintext", "search_term": "generative AI"},
-            {"field_name": "document_title", "search_term": "AI"}
-          ]
-    """
-    try:
-        # Parameter validation
-        if not vector_search_term or not vector_search_term.strip():
-            return format_json_response({"error": "vector_search_term cannot be empty"})
-        
-        if full_text_queries is None:
-            full_text_queries = []
-        
-        if len(full_text_queries) > 8:
-            return format_json_response({"error": "full_text_queries cannot exceed 8 items"})
-        
-        # Validate field names
-        valid_fields = {
-            "document_author",
-            "document_title",
-            "highlight_note",
-            "highlight_plaintext",
-            "highlight_tags"
-        }
-        
-        for i, query in enumerate(full_text_queries):
-            if not isinstance(query, dict):
-                return format_json_response({"error": f"full_text_queries[{i}] must be a dictionary"})
-            
-            field_name = query.get("field_name")
-            search_term = query.get("search_term")
-            
-            if not field_name:
-                return format_json_response({"error": f"full_text_queries[{i}] missing 'field_name'"})
-            if not search_term:
-                return format_json_response({"error": f"full_text_queries[{i}] missing 'search_term'"})
-            
-            if field_name not in valid_fields:
-                return format_json_response({
-                    "error": f"Invalid field_name '{field_name}' in full_text_queries[{i}]. Must be one of: {', '.join(valid_fields)}"
-                })
-        
-        # Call the MCP search endpoint
-        result = await client.search_highlights_mcp(
-            vector_search_term=vector_search_term.strip(),
-            full_text_queries=full_text_queries
-        )
-        
-        # The MCP endpoint returns results directly in the response
-        # Format matches the official implementation
-        return format_json_response({
-            "results": result.get("results", []),
-            "count": len(result.get("results", []))
-        })
-        
-    except ValueError as e:
-        logger.error(f"Validation error in MCP search: {e}")
-        return format_json_response({"error": str(e), "message": "Invalid search parameters"})
-    except Exception as e:
-        logger.error(f"Error in MCP search: {e}")
-        logger.error(traceback.format_exc())
-        return format_json_response({"error": str(e), "message": "Failed to search highlights via MCP endpoint"})
 
 
 @mcp.tool()

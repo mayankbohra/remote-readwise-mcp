@@ -119,13 +119,14 @@ Try asking Claude:
 ### Highlights Tools (7 tools)
 - **List highlights** - Browse with date filters
 - **Daily review** - Spaced repetition system
-- **Search highlights** - Find by text query
+- **Search highlights** - Find by text query using enhanced MCP endpoint with vector/semantic search
 - **List books** - View books with highlight counts
 - **Get book highlights** - All highlights from a specific book
 - **Export highlights** - Backup everything
 - **Create highlights** - Add manual highlights
 
 ### 🚀 Advanced Features
+- ✅ **Enhanced MCP Search** - Uses Readwise's MCP endpoint with vector/semantic search for better results
 - ✅ **Unlimited pagination** - Fetch ALL your data
 - ✅ **Incremental sync** - Get only new/updated items
 - ✅ **Smart filtering** - Filter by author, site, dates
@@ -211,8 +212,8 @@ docker run -p 8000:8000 \
 
 ```
 readwise-mcp-server/
-├── main.py              # FastMCP server (12 tools)
-├── readwise_client.py   # Readwise API client
+├── main.py              # FastMCP server (12 tools with enhanced MCP search)
+├── readwise_client.py   # Readwise API client (supports MCP endpoints)
 ├── requirements.txt     # Python dependencies
 ├── Dockerfile          # Container config
 ├── render.yaml         # Render deployment
