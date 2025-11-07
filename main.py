@@ -93,6 +93,159 @@ def format_json_response(data: Dict[str, Any], max_size: int = MAX_RESPONSE_SIZE
             return '{"error": "Failed to format response"}'
 
 
+# ==================== Relevance Scoring and Parallel Fetching ====================
+
+def calculate_relevance_score(item: Dict[str, Any], query_terms: List[str], query_lower: str) -> float:
+    """
+    Fast relevance scoring function optimized for performance.
+    
+    Args:
+        item: Dictionary containing highlight/document data
+        query_terms: Pre-processed query terms (lowercased, split)
+        query_lower: Full query string (lowercased)
+    
+    Returns:
+        Relevance score (0.0 to 1.0+)
+    """
+    score = 0.0
+    
+    # Get text fields (pre-lowercase for efficiency)
+    text = (item.get("text") or "").lower()
+    title = (item.get("title") or "").lower()
+    note = (item.get("note") or "").lower()
+    
+    # Check for exact phrase match first (highest priority, early exit optimization)
+    if query_lower in text:
+        score += 5.0  # Exact phrase match in text
+    if query_lower in title:
+        score += 15.0  # Exact phrase match in title (3x weight)
+    if query_lower in note:
+        score += 10.0  # Exact phrase match in note (2x weight)
+    
+    # Count query term frequency
+    for term in query_terms:
+        if not term:
+            continue
+        
+        # Term frequency in text (weighted by position - earlier is better)
+        text_count = text.count(term)
+        if text_count > 0:
+            # Weight by position (first 100 chars get 2x, next 200 get 1.5x)
+            position_weight = 1.0
+            if len(text) > 0:
+                first_occurrence = text.find(term)
+                if first_occurrence < 100:
+                    position_weight = 2.0
+                elif first_occurrence < 300:
+                    position_weight = 1.5
+            score += text_count * position_weight
+        
+        # Term frequency in title (3x weight)
+        title_count = title.count(term)
+        if title_count > 0:
+            score += title_count * 3.0
+        
+        # Term frequency in notes (2x weight)
+        note_count = note.count(term)
+        if note_count > 0:
+            score += note_count * 2.0
+    
+    # Bonus for having all query terms present
+    terms_found = sum(1 for term in query_terms if term and (term in text or term in title or term in note))
+    if terms_found == len(query_terms) and len(query_terms) > 1:
+        score += 2.0  # All terms present bonus
+    
+    # Normalize score (cap at reasonable maximum)
+    return min(score / 10.0, 10.0)  # Normalize and cap
+
+
+async def fetch_pages_parallel(
+    fetch_func,
+    query: Optional[str] = None,
+    num_pages: int = 5,
+    page_size: int = 100,
+    batch_size: int = 3,
+    rate_limit_delay: float = 0.2,
+    **kwargs
+) -> List[Dict[str, Any]]:
+    """
+    Fetch multiple pages in parallel with rate limiting.
+    
+    Args:
+        fetch_func: Async function that fetches a single page (takes page, page_size, **kwargs)
+        query: Optional query string for relevance scoring
+        num_pages: Number of pages to fetch
+        page_size: Results per page
+        batch_size: Number of pages to fetch concurrently (default: 3)
+        rate_limit_delay: Delay between batches (default: 0.2 seconds)
+        **kwargs: Additional arguments to pass to fetch_func
+    
+    Returns:
+        List of all results from all pages
+    """
+    all_results = []
+    query_terms = []
+    query_lower = ""
+    
+    # Pre-process query if provided
+    if query:
+        query_lower = query.lower().strip()
+        query_terms = [t.strip() for t in query_lower.split() if t.strip()]
+    
+    # Fetch pages in batches
+    for batch_start in range(1, num_pages + 1, batch_size):
+        batch_end = min(batch_start + batch_size, num_pages + 1)
+        batch_pages = list(range(batch_start, batch_end))
+        
+        # Fetch batch pages concurrently
+        tasks = [
+            fetch_func(page=page, page_size=page_size, **kwargs)
+            for page in batch_pages
+        ]
+        
+        try:
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process batch results
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Error fetching page: {result}")
+                    continue
+                
+                if isinstance(result, dict):
+                    results = result.get("results", [])
+                elif isinstance(result, list):
+                    results = result
+                else:
+                    continue
+                
+                if not results:
+                    continue
+                
+                all_results.extend(results)
+            
+            # Rate limiting: delay between batches (not between individual requests)
+            if batch_end <= num_pages:
+                await asyncio.sleep(rate_limit_delay)
+        
+        except Exception as e:
+            logger.error(f"Error in parallel fetch batch: {e}")
+            break
+    
+    # Score and sort by relevance if query provided
+    if query and query_terms and all_results:
+        scored_results = [
+            (item, calculate_relevance_score(item, query_terms, query_lower))
+            for item in all_results
+        ]
+        # Sort by score descending
+        scored_results.sort(key=lambda x: x[1], reverse=True)
+        all_results = [item for item, score in scored_results]
+    # If no query, results are returned in API order (which may already be by relevance)
+    
+    return all_results
+
+
 # ==================== Custom Authentication ====================
 # Note: FastMCP 2.0+ handles auth differently
 # We'll implement API key validation in the app setup below
@@ -146,57 +299,62 @@ async def readwise_list_documents(
     category: Optional[str] = None,
     author: Optional[str] = None,
     site_name: Optional[str] = None,
-    limit: Optional[int] = 20,
+    limit: int = 20,
     fetch_all: bool = False,
     updated_after: Optional[str] = None,
     with_full_content: bool = False,
     content_max_length: Optional[int] = None,
-    max_limit: Optional[int] = 1000
+    max_limit: Optional[int] = 50
 ) -> str:
     """
-    List documents from Readwise Reader with advanced filtering and rate-limited fetch support.
+    List documents from Readwise Reader with advanced filtering. Returns limited results for context efficiency.
 
     Args:
         location: Filter by location (new, later, archive, feed)
         category: Filter by category (article, email, rss, etc.)
         author: Filter by author name (case-insensitive partial match)
         site_name: Filter by site name (case-insensitive partial match)
-        limit: Maximum documents to return (default: 20). Used when fetch_all=False
-        fetch_all: If True, fetches documents up to max_limit (default: 1000)
+        limit: Maximum documents to return (default: 20). Recommended: 10-30 for context efficiency.
+        fetch_all: If True, fetches documents up to max_limit (default: False, not recommended for context efficiency)
         updated_after: ISO 8601 timestamp - only documents updated after this time
                       Example: "2025-11-01T00:00:00Z"
                       Useful for incremental syncs (fetch only new/updated docs)
-        with_full_content: Include full document content (warning: may be large)
+        with_full_content: Include full document content (warning: uses significant context, not recommended)
         content_max_length: Limit content length per document
-        max_limit: Maximum documents to fetch when fetch_all=True (default: 1000)
+        max_limit: Maximum documents to fetch when fetch_all=True (default: 50, use sparingly)
 
     Returns:
-        JSON string with filtered document list
+        JSON string with filtered document list (limited to 'limit' for context efficiency)
 
     Examples:
-        - Get documents by author: fetch_all=True, author="sukhad anand", max_limit=500
-        - Get all LinkedIn posts: fetch_all=True, site_name="linkedin.com"
-        - Get recent articles: updated_after="2025-11-01T00:00:00Z", category="article"
-        - Incremental sync: fetch_all=True, updated_after="2025-11-28T00:00:00Z"
+        - Get recent documents: limit=20
+        - Get documents by author: author="sukhad anand", limit=30
+        - Get recent articles: updated_after="2025-11-01T00:00:00Z", category="article", limit=20
     """
     try:
         # Parameter validation
+        if limit <= 0 or limit > 1000:
+            return format_json_response({"error": "limit must be between 1 and 1000"})
         if max_limit is not None and max_limit <= 0:
             return format_json_response({"error": "max_limit must be a positive integer"})
-        if limit is not None and limit <= 0:
-            return format_json_response({"error": "limit must be a positive integer"})
         
-        # Fetch documents from API
-        effective_limit = None if fetch_all else limit
+        # Determine fetch strategy: fetch more than limit to find best matches
+        # For cursor-based pagination, we fetch sequentially but get more results
+        if fetch_all and max_limit:
+            target_results = min(max_limit, limit * 10)
+        else:
+            target_results = limit * 5  # Fetch 5x to find best matches
+        
+        # Fetch documents from API - fetch more than limit for relevance ranking
         documents = await client.list_documents(
             location=location,
             category=category,
-            limit=effective_limit,
+            limit=target_results if not fetch_all else None,
             updated_after=updated_after,
-            max_limit=max_limit if fetch_all else None
+            max_limit=target_results if fetch_all else None
         )
-
-        # Apply client-side filtering
+        
+        # Apply client-side filtering first
         if author:
             author_lower = author.lower()
             documents = [
@@ -210,6 +368,31 @@ async def readwise_list_documents(
                 doc for doc in documents
                 if doc.get("site_name") and site_lower in doc["site_name"].lower()
             ]
+        
+        # Build query string from filters for relevance scoring (after filtering)
+        query_parts = []
+        if author:
+            query_parts.append(author)
+        if site_name:
+            query_parts.append(site_name)
+        query_str = " ".join(query_parts) if query_parts else None
+        
+        # Score by relevance if we have filters (helps rank filtered results)
+        if query_str and documents:
+            query_lower = query_str.lower()
+            query_terms = [t.strip() for t in query_lower.split() if t.strip()]
+            
+            # Score all filtered documents
+            scored_docs = [
+                (doc, calculate_relevance_score(doc, query_terms, query_lower))
+                for doc in documents
+            ]
+            # Sort by relevance
+            scored_docs.sort(key=lambda x: x[1], reverse=True)
+            documents = [doc for doc, score in scored_docs]
+        
+        # Take top N (either most relevant or first N if no scoring)
+        documents = documents[:limit]
 
         # Process content if requested
         if not with_full_content:
@@ -237,6 +420,7 @@ async def readwise_list_documents(
             "count": len(documents),
             "results": documents,
             "filters_applied": filters_applied,
+            "limit_applied": limit,
             "fetch_mode": "all" if fetch_all else "paginated"
         })
     except Exception as e:
@@ -344,35 +528,39 @@ async def readwise_list_tags() -> str:
 @mcp.tool()
 async def readwise_list_highlights(
     book_id: Optional[int] = None,
-    page_size: int = 100,
+    limit: int = 20,
+    page_size: int = 20,
     page: int = 1,
     fetch_all: bool = False,
     highlighted_at__gt: Optional[str] = None,
     highlighted_at__lt: Optional[str] = None,
-    max_limit: Optional[int] = 5000
+    max_limit: Optional[int] = 50
 ) -> str:
     """
-    List highlights from Readwise with advanced filtering and rate-limited fetch support.
+    List highlights from Readwise with advanced filtering. Returns limited results for context efficiency.
 
     Args:
         book_id: Filter by specific book ID
-        page_size: Number of highlights per page (max 1000, ignored if fetch_all=True)
-        page: Page number (ignored if fetch_all=True)
-        fetch_all: If True, fetches highlights up to max_limit (default: 5000)
+        limit: Maximum number of highlights to return (default: 20). Recommended: 10-30 for context efficiency.
+        page_size: Number of highlights per page when paginating (default: 20, max 1000, ignored if fetch_all=True)
+        page: Page number when paginating (default: 1, ignored if fetch_all=True)
+        fetch_all: If True, fetches highlights up to max_limit (default: False, not recommended for context efficiency)
         highlighted_at__gt: Filter highlights after this date (ISO 8601)
         highlighted_at__lt: Filter highlights before this date (ISO 8601)
-        max_limit: Maximum highlights to fetch when fetch_all=True (default: 5000)
+        max_limit: Maximum highlights to fetch when fetch_all=True (default: 50, use sparingly)
 
     Returns:
-        JSON string with highlights
+        JSON string with highlights (limited to 'limit' for context efficiency)
 
     Examples:
-        - Get highlights: fetch_all=True, max_limit=1000
-        - Get highlights from specific book: fetch_all=True, book_id=12345
-        - Get highlights from last week: highlighted_at__gt="2025-11-01T00:00:00Z"
+        - Get recent highlights: limit=20
+        - Get highlights from specific book: book_id=12345, limit=30
+        - Get highlights from last week: highlighted_at__gt="2025-11-01T00:00:00Z", limit=20
     """
     try:
         # Parameter validation
+        if limit <= 0 or limit > 1000:
+            return format_json_response({"error": "limit must be between 1 and 1000"})
         if max_limit is not None and max_limit <= 0:
             return format_json_response({"error": "max_limit must be a positive integer"})
         if page_size <= 0 or page_size > 1000:
@@ -386,17 +574,41 @@ async def readwise_list_highlights(
         if highlighted_at__lt:
             filters["highlighted_at__lt"] = highlighted_at__lt
 
-        result = await client.list_highlights(
+        # Determine how many pages to fetch for relevance ranking
+        if fetch_all and max_limit:
+            target_results = min(max_limit, limit * 10)
+        else:
+            target_results = limit * 5  # Fetch 5x to find best matches
+        
+        num_pages = max(3, min(10, (target_results + page_size - 1) // page_size))
+        
+        # Create fetch function wrapper
+        async def fetch_page(page: int, page_size: int, **kwargs):
+            result = await client.list_highlights(
+                page_size=page_size,
+                page=page,
+                book_id=book_id,
+                fetch_all=False,
+                max_limit=None,
+                **kwargs
+            )
+            return result
+        
+        # Fetch pages in parallel (no query for relevance scoring, just parallel fetch)
+        all_highlights = await fetch_pages_parallel(
+            fetch_func=fetch_page,
+            query=None,  # No query for list_highlights
+            num_pages=num_pages,
             page_size=page_size,
-            page=page,
-            book_id=book_id,
-            fetch_all=fetch_all,
-            max_limit=max_limit if fetch_all else None,
+            batch_size=3,
+            rate_limit_delay=client.rate_limit_delay,
             **filters
         )
+        
+        # Take top N (already sorted by API relevance, or just take first N)
+        highlights = all_highlights[:limit]
 
         # Optimize response - only return essential fields
-        highlights = result.get("results", [])
         optimized = [
             {
                 "id": h.get("id"),
@@ -408,12 +620,13 @@ async def readwise_list_highlights(
             for h in highlights
         ]
 
-        total_count = result.get("count", len(optimized))
         return format_json_response({
-            "count": total_count,
+            "count": len(optimized),
             "results": optimized,
-            "fetch_mode": "all pages" if fetch_all else f"page {page}",
-            "book_id": book_id
+            "limit_applied": limit,
+            "book_id": book_id,
+            "pages_searched": num_pages if 'num_pages' in locals() else 1,
+            "total_fetched": len(all_highlights) if 'all_highlights' in locals() else len(optimized)
         })
     except Exception as e:
         logger.error(f"Error listing highlights: {e}")
@@ -459,49 +672,80 @@ async def readwise_get_daily_review() -> str:
 @mcp.tool()
 async def readwise_search_highlights(
     query: str,
+    limit: int = 20,
     page_size: int = 100,
-    page: int = 1,
     fetch_all: bool = False,
-    max_limit: Optional[int] = 5000
+    max_limit: Optional[int] = 500
 ) -> str:
     """
-    Search highlights by text query with rate-limited fetch support.
+    Search highlights by text query with parallel fetching and relevance ranking.
+    Fetches multiple pages in parallel, scores ALL results by relevance, returns top N most relevant.
+    
+    This ensures relevant results beyond the first page are found and ranked properly.
+    Uses parallel fetching for low latency (1-3 seconds typical).
 
     Args:
         query: Search term (searches highlight text and notes)
-        page_size: Number of results per page (ignored if fetch_all=True)
-        page: Page number (ignored if fetch_all=True)
-        fetch_all: If True, fetches matching highlights up to max_limit (default: 5000)
-        max_limit: Maximum highlights to fetch when fetch_all=True (default: 5000)
+        limit: Maximum number of results to return (default: 20). Recommended: 10-30 for context efficiency.
+        page_size: Number of results per page (default: 100, max 1000)
+        fetch_all: If True, fetches more pages up to max_limit (default: False)
+        max_limit: Maximum highlights to fetch when fetch_all=True (default: 500)
 
     Returns:
-        JSON string with matching highlights
+        JSON string with top N most relevant highlights (scored and ranked)
 
     Examples:
-        - Search highlights: query="machine learning", fetch_all=True, max_limit=1000
-        - Search first page: query="python", page_size=50
+        - Quick search: query="machine learning", limit=20
+        - More results: query="python", limit=50
+        - Comprehensive search: query="AI", fetch_all=True, max_limit=500
     """
     try:
         # Parameter validation
         if not query or not query.strip():
             return format_json_response({"error": "query cannot be empty"})
+        if limit <= 0 or limit > 1000:
+            return format_json_response({"error": "limit must be between 1 and 1000"})
         if max_limit is not None and max_limit <= 0:
             return format_json_response({"error": "max_limit must be a positive integer"})
         if page_size <= 0 or page_size > 1000:
             return format_json_response({"error": "page_size must be between 1 and 1000"})
-        if page <= 0:
-            return format_json_response({"error": "page must be a positive integer"})
         
-        result = await client.search_highlights(
-            query=query.strip(),
+        query_clean = query.strip()
+        
+        # Determine how many pages to fetch based on limit
+        # Fetch 5-10x the limit to find best matches across pages
+        if fetch_all and max_limit:
+            target_results = min(max_limit, limit * 10)
+        else:
+            target_results = limit * 5  # Fetch 5x to find best matches
+        
+        num_pages = max(3, min(10, (target_results + page_size - 1) // page_size))
+        
+        # Create fetch function wrapper
+        async def fetch_page(page: int, page_size: int, **kwargs):
+            result = await client.search_highlights(
+                query=query_clean,
+                page_size=page_size,
+                page=page,
+                fetch_all=False,
+                max_limit=None
+            )
+            return result
+        
+        # Fetch pages in parallel with relevance scoring
+        all_highlights = await fetch_pages_parallel(
+            fetch_func=fetch_page,
+            query=query_clean,
+            num_pages=num_pages,
             page_size=page_size,
-            page=page,
-            fetch_all=fetch_all,
-            max_limit=max_limit if fetch_all else None
+            batch_size=3,
+            rate_limit_delay=client.rate_limit_delay
         )
-
-        # Optimize response
-        highlights = result.get("results", [])
+        
+        # Take top N most relevant (already sorted by relevance_score)
+        highlights = all_highlights[:limit]
+        
+        # Optimize response - only return essential fields
         optimized = [
             {
                 "id": h.get("id"),
@@ -513,12 +757,14 @@ async def readwise_search_highlights(
             for h in highlights
         ]
 
-        total_count = result.get("count", len(optimized))
         return format_json_response({
-            "count": total_count,
+            "count": len(optimized),
             "results": optimized,
-            "query": query.strip(),
-            "fetch_mode": "all matches" if fetch_all else f"page {page}"
+            "query": query_clean,
+            "limit_applied": limit,
+            "pages_searched": num_pages,
+            "total_fetched": len(all_highlights),
+            "note": f"Searched {num_pages} pages in parallel, scored {len(all_highlights)} results, returned top {len(optimized)} most relevant."
         })
     except Exception as e:
         logger.error(f"Error searching highlights: {e}")
@@ -529,55 +775,79 @@ async def readwise_search_highlights(
 @mcp.tool()
 async def readwise_list_books(
     category: Optional[str] = None,
+    limit: int = 20,
     page_size: int = 100,
-    page: int = 1,
     fetch_all: bool = False,
     last_highlight_at__gt: Optional[str] = None,
-    max_limit: Optional[int] = 1000
+    max_limit: Optional[int] = 500
 ) -> str:
     """
-    List books with highlight metadata and rate-limited fetch support.
+    List books with highlight metadata using parallel fetching for low latency.
 
     Args:
         category: Filter by category (books, articles, tweets, podcasts)
-        page_size: Number of books per page (ignored if fetch_all=True)
-        page: Page number (ignored if fetch_all=True)
-        fetch_all: If True, fetches books up to max_limit (default: 1000)
+        limit: Maximum number of books to return (default: 20)
+        page_size: Number of books per page (default: 100, max 1000)
+        fetch_all: If True, fetches more pages up to max_limit (default: False)
         last_highlight_at__gt: Filter books with highlights after this date
-        max_limit: Maximum books to fetch when fetch_all=True (default: 1000)
+        max_limit: Maximum books to fetch when fetch_all=True (default: 500)
 
     Returns:
         JSON string with books
 
     Examples:
-        - Get books: fetch_all=True, max_limit=500
-        - Get all articles: fetch_all=True, category="articles"
-        - Get books with recent highlights: last_highlight_at__gt="2025-11-01T00:00:00Z"
+        - Get books: limit=20
+        - Get all articles: category="articles", limit=50
+        - Get books with recent highlights: last_highlight_at__gt="2025-11-01T00:00:00Z", limit=30
     """
     try:
         # Parameter validation
+        if limit <= 0 or limit > 1000:
+            return format_json_response({"error": "limit must be between 1 and 1000"})
         if max_limit is not None and max_limit <= 0:
             return format_json_response({"error": "max_limit must be a positive integer"})
         if page_size <= 0 or page_size > 1000:
             return format_json_response({"error": "page_size must be between 1 and 1000"})
-        if page <= 0:
-            return format_json_response({"error": "page must be a positive integer"})
         
         filters = {}
         if last_highlight_at__gt:
             filters["last_highlight_at__gt"] = last_highlight_at__gt
 
-        result = await client.list_books(
+        # Determine how many pages to fetch
+        if fetch_all and max_limit:
+            target_results = min(max_limit, limit * 10)
+        else:
+            target_results = limit * 5  # Fetch 5x to find best matches
+        
+        num_pages = max(3, min(10, (target_results + page_size - 1) // page_size))
+        
+        # Create fetch function wrapper
+        async def fetch_page(page: int, page_size: int, **kwargs):
+            result = await client.list_books(
+                page_size=page_size,
+                page=page,
+                category=category,
+                fetch_all=False,
+                max_limit=None,
+                **kwargs
+            )
+            return result
+        
+        # Fetch pages in parallel
+        all_books = await fetch_pages_parallel(
+            fetch_func=fetch_page,
+            query=None,  # No query for list_books
+            num_pages=num_pages,
             page_size=page_size,
-            page=page,
-            category=category,
-            fetch_all=fetch_all,
-            max_limit=max_limit if fetch_all else None,
+            batch_size=3,
+            rate_limit_delay=client.rate_limit_delay,
             **filters
         )
+        
+        # Take top N
+        books = all_books[:limit]
 
         # Optimize response
-        books = result.get("results", [])
         optimized = [
             {
                 "id": b.get("id"),
@@ -589,12 +859,13 @@ async def readwise_list_books(
             for b in books
         ]
 
-        total_count = result.get("count", len(optimized))
         return format_json_response({
-            "count": total_count,
+            "count": len(optimized),
             "results": optimized,
             "category": category,
-            "fetch_mode": "all pages" if fetch_all else f"page {page}"
+            "limit_applied": limit,
+            "pages_searched": num_pages,
+            "total_fetched": len(all_books)
         })
     except Exception as e:
         logger.error(f"Error listing books: {e}")
